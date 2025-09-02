@@ -8,6 +8,10 @@
 #include "c_parser.h"      // C    → AST
 #include "codegen_c.h"
 #include "codegen_vhdl.h"
+#include "vhdl_pragmas.h"  // <-- NEU: Java-Kommentar-Pragmas → VHDL-Hints
+
+// Forward-Deklaration; Setter ist in codegen_vhdl.c implementiert.
+void codegen_vhdl_set_hints(const VhdlHints *hints);
 
 #define EXIT_OK 0
 #define EXIT_PARSE_ERROR 1
@@ -115,6 +119,12 @@ int main(int argc, char **argv) {
     Program *ast = parse_java(in_path, buf, n);
     free(buf);
     if (!ast){ return EXIT_PARSE_ERROR; }
+
+    // >>> PRAGMAS: Java-Kommentare einlesen und dem VHDL-Backend übergeben
+    VhdlHints hints;
+    vhdl_pragmas_from_java(in_path, &hints);   // liest Datei erneut ein und füllt 'hints' (robust gegen fehlende Pragmas)
+    codegen_vhdl_set_hints(&hints);            // an Backend übergeben
+
     bool ok = codegen_vhdl(ast, out_path);
     ast_free_program(ast);
     if (!ok){ diag_error_simple(out_path, "failed to write VHDL output"); return EXIT_IO_ERROR; }

@@ -1,3 +1,7 @@
+// vhdl-dialect: v93
+// entity-name: fe
+// output-name: out
+// sensitivity-list: base, exponent, modulus
 public class FastExponential {
   public static int fastExponential(int base, int exponent, int modulus) {
     int b;

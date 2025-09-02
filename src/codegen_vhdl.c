@@ -1,25 +1,47 @@
 #include "codegen_vhdl.h"
 #include "ast.h"
+#include "vhdl_pragmas.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 /*
- * VHDL Codegen (MVP)
- * - Entity/Architecture je Methode, rein kombinatorischer process(all).
+ * VHDL Codegen (MVP) + Pragmas
+ * - Entity/Architecture je Methode, standardmäßig kombinational.
  * - Typen: int32→signed(31 downto 0), int64→signed(63 downto 0), bool→std_logic.
  * - if/else, return, Zuweisungen, VarDecl.
- * - for (konstante Grenzen, Schritt ±1) → echte VHDL for-loop (Loopvar nur gesetzt, wenn im Body benutzt).
- * - while (Muster: i init als Literal vorher im selben Block; Bedingung i ? K oder K ? i mit <?<=?>=; Body endet mit i=i±1
- *   und verändert i sonst nicht) → Transformation zu for-loop; trailing i=i±1 wird unterdrückt.
+ * - for (konstante Grenzen, Schritt ±1) → native VHDL for-loop.
+ * - while (Muster: Literal-Init im selben Block; Bedingung i ? C; Body endet mit i=i±1) → for-Loop;
+ *   letztes i=i±1 wird im Body unterdrückt.
  * - Division/Modulo im Vektor-Kontext: to_signed(to_integer(L) op to_integer(R), WIDTH).
  * - Peepholes:
- *     (1) 1 % X  → to_signed(1, WIDTH)
- *     (2) Nach "v = ... % ...;" folgendes "if (v < 0) v = v + ...;" wird unterdrückt.
+ *     (1) 1 % X → to_signed(1, WIDTH)
+ *     (2) Unmittelbar nach "v := ... mod ...;" folgendes "if (v < 0) v := v + ...;" wird entfernt.
+ *
+ * Pragmas (aus vhdl_pragmas.[ch]):
+ *   - entity-name, output-name
+ *   - vhdl-dialect: v93 | v2008
+ *   - sensitivity-list ODER sensitivity_list (Alias akzeptiert)
+ * Bibliotheken sind immer:
+ *   library ieee;
+ *   use ieee.std_logic_1164.all;
+ *   use ieee.numeric_std.all;
  */
 
-// --------------------------------------------------
-// Emit-Helfer
+/* ------------------------------------------------------------------------- */
+/* Globale Hints (per main.c gesetzt)                                        */
+static VhdlHints g_hints;
+static bool g_have_hints = false;
+
+void codegen_vhdl_set_hints(const VhdlHints *h) {
+  if (h) { g_hints = *h; g_have_hints = true; }
+  else { memset(&g_hints, 0, sizeof g_hints); g_have_hints = false; }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Emit-Helfer                                                                */
 typedef struct { FILE *f; int indent; } Em;
 static void em_init(Em *e, FILE *f){ e->f=f; e->indent=0; }
 static void em_nl(Em *e){ fputc('\n', e->f); }
@@ -27,8 +49,8 @@ static void em_ind(Em *e){ for (int i=0;i<e->indent;i++) fputs("  ", e->f); }
 static void em_inc(Em *e){ e->indent++; }
 static void em_dec(Em *e){ if (e->indent>0) e->indent--; }
 
-// --------------------------------------------------
-// Kleine Vektor-Helfer (lokal, um Makro-Kollisionen zu vermeiden)
+/* ------------------------------------------------------------------------- */
+/* Kleine lokale Vektoren (Makro nicht mit ast.h kollidieren lassen)         */
 #define VEC_LOCAL_DECL(T, Name) \
   typedef struct { T *items; size_t len; size_t cap; } Name; \
   static void Name##_init(Name *v){ v->items=NULL; v->len=v->cap=0; } \
@@ -38,29 +60,46 @@ static void em_dec(Em *e){ if (e->indent>0) e->indent--; }
     v->items[v->len++]=x; return true; \
   }
 
-// --------------------------------------------------
-// Symboltabelle
+/* ------------------------------------------------------------------------- */
+/* Symboltabelle                                                              */
 typedef struct { char *name; TypeKind kind; bool is_param; } Sym;
 VEC_LOCAL_DECL(Sym,   VecSym)
 VEC_LOCAL_DECL(char*, VecStr)
 
-static int width_of(TypeKind k){ switch(k){ case TY_INT: return 32; case TY_LONG: return 64; default: return 0; } }
+static int width_of(TypeKind k){
+  switch(k){
+    case TY_INT:     return 32;
+    case TY_LONG:    return 64;
+    case TY_BOOLEAN: return 1;
+    default:         return 0;
+  }
+}
 static const char* vhdl_type(TypeKind k){
   switch (k){
     case TY_INT:     return "signed(31 downto 0)";
     case TY_LONG:    return "signed(63 downto 0)";
     case TY_BOOLEAN: return "std_logic";
     case TY_VOID:    return "void /*unsupported*/";
-  } return "signed(31 downto 0)";
+  }
+  return "signed(31 downto 0)";
 }
 static const char* vhdl_binop(BinOpKind k){
   switch (k){
-    case BIN_ADD: return "+"; case BIN_SUB: return "-"; case BIN_MUL: return "*";
-    case BIN_DIV: return "/"; case BIN_MOD: return "mod";
-    case BIN_EQ: return "="; case BIN_NEQ: return "/=";
-    case BIN_LT: return "<"; case BIN_LE: return "<="; case BIN_GT: return ">"; case BIN_GE: return ">=";
-    case BIN_AND: return "and"; case BIN_OR: return "or";
-  } return "?";
+    case BIN_ADD: return "+";
+    case BIN_SUB: return "-";
+    case BIN_MUL: return "*";
+    case BIN_DIV: return "/";
+    case BIN_MOD: return "mod";
+    case BIN_EQ:  return "=";
+    case BIN_NEQ: return "/=";
+    case BIN_LT:  return "<";
+    case BIN_LE:  return "<=";
+    case BIN_GT:  return ">";
+    case BIN_GE:  return ">=";
+    case BIN_AND: return "and";
+    case BIN_OR:  return "or";
+  }
+  return "?";
 }
 static TypeKind sym_lookup(VecSym *sy, const char *name, bool *is_param_out){
   for (size_t i=0;i<sy->len;i++){
@@ -73,8 +112,8 @@ static TypeKind sym_lookup(VecSym *sy, const char *name, bool *is_param_out){
   return TY_INT;
 }
 
-// --------------------------------------------------
-// Analyse-Helfer
+/* ------------------------------------------------------------------------- */
+/* Analyse-Helfer                                                             */
 static bool expr_uses_var(Expr *e, const char *name){
   if (!e || !name) return false;
   switch (e->kind){
@@ -110,12 +149,12 @@ static bool stmt_uses_var(Stmt *s, const char *name){
   }
   return false;
 }
-// prüfe jede Art von Zuweisung an name (konservativ)
 static bool body_assigns_var_anywhere(Stmt *s, const char *name){
   if (!s) return false;
   switch (s->kind){
     case ST_BLOCK:
-      for (size_t i=0;i<s->block.stmts.len;i++) if (body_assigns_var_anywhere(s->block.stmts.items[i], name)) return true;
+      for (size_t i=0;i<s->block.stmts.len;i++)
+        if (body_assigns_var_anywhere(s->block.stmts.items[i], name)) return true;
       return false;
     case ST_IF:
       if (body_assigns_var_anywhere(s->if_s.then_br, name)) return true;
@@ -136,13 +175,13 @@ static bool body_assigns_var_anywhere(Stmt *s, const char *name){
   return false;
 }
 
-// For-Shape (auch für while-Analyse)
+/* For-Shape / Vergleich-Normalisierung */
 typedef struct { long long start; long long bound; int step; int cmp; } ForShape; // cmp:0<,1<=,2>,3>=
 static int cmp_from_binop(BinOpKind op){
   switch (op){ case BIN_LT: return 0; case BIN_LE: return 1; case BIN_GT: return 2; case BIN_GE: return 3; default: return -1; }
 }
 
-// Schritt-Erkennung toleranter: i = i ± 1  ODER  i = 1 + i
+/* Schritt-Erkennung: i=i±1 oder 1+i */
 static bool is_post_step_stmt(Stmt *s, const char *vn, int *step_out){
   if (!s || s->kind!=ST_EXPR || !s->expr_s.expr) return false;
   Expr *e = s->expr_s.expr;
@@ -155,41 +194,36 @@ static bool is_post_step_stmt(Stmt *s, const char *vn, int *step_out){
   Expr *R = e->assign.rhs->binop.rhs;
   BinOpKind op = e->assign.rhs->binop.op;
 
-  // Variante A: i = i ± 1
   if (L && L->kind==EX_VAR && strcmp(L->var.name, vn)==0 &&
       R && R->kind==EX_INT_LIT && R->int_lit.value==1){
     if (op==BIN_ADD){ if (step_out) *step_out = +1; return true; }
     if (op==BIN_SUB){ if (step_out) *step_out = -1; return true; }
     return false;
   }
-  // Variante B: i = 1 + i  (nur Addition → +1)
   if (L && L->kind==EX_INT_LIT && L->int_lit.value==1 &&
       R && R->kind==EX_VAR && strcmp(R->var.name, vn)==0){
     if (op==BIN_ADD){ if (step_out) *step_out = +1; return true; }
-    return false; // 1 - i ist KEIN „-1“-Schritt
+    return false;
   }
   return false;
 }
 
-// Vergleich i ? C oder C ? i auf Normalform "i ? C" bringen
+/* i ? C bzw. C ? i → Normalform "i ? C" */
 static bool normalize_var_cmp(Expr *cond, const char **vn_out, long long *bound_out, int *cmp_out){
-  // cmp: 0:<, 1:<=, 2:>, 3:>=  — jeweils aus Sicht "i ? C"
   if (!cond || cond->kind!=EX_BINOP) return false;
   Expr *L = cond->binop.lhs;
   Expr *R = cond->binop.rhs;
   BinOpKind op = cond->binop.op;
 
-  // i ? C
   if (L && L->kind==EX_VAR && R && R->kind==EX_INT_LIT){
-    *vn_out = L->var.name;
-    *bound_out = R->int_lit.value;
+    if (vn_out) *vn_out = L->var.name;
+    if (bound_out) *bound_out = R->int_lit.value;
     switch (op){ case BIN_LT:*cmp_out=0;return true; case BIN_LE:*cmp_out=1;return true;
                  case BIN_GT:*cmp_out=2;return true; case BIN_GE:*cmp_out=3;return true; default: return false; }
   }
-  // C ? i  → umdrehen
   if (L && L->kind==EX_INT_LIT && R && R->kind==EX_VAR){
-    *vn_out = R->var.name;
-    *bound_out = L->int_lit.value;
+    if (vn_out) *vn_out = R->var.name;
+    if (bound_out) *bound_out = L->int_lit.value;
     switch (op){
       case BIN_LT: *cmp_out = 2; return true; // C < i  → i > C
       case BIN_LE: *cmp_out = 3; return true; // C <= i → i >= C
@@ -201,7 +235,7 @@ static bool normalize_var_cmp(Expr *cond, const char **vn_out, long long *bound_
   return false;
 }
 
-// Body ändert i unzulässig (alles außer finalem i=i±1)?
+/* Body darf i außer finalem Schritt nicht ändern */
 static bool body_assigns_var_except_trailing_step(Stmt *body, const char *vn){
   if (!body) return true;
 
@@ -215,20 +249,18 @@ static bool body_assigns_var_except_trailing_step(Stmt *body, const char *vn){
     return false;
   }
 
-  // Single-Statement-Body:
   int st=0;
-  if (is_post_step_stmt(body, vn, &st)) return false; // nur der Schritt → ok
-  return body_assigns_var_anywhere(body, vn);         // sonst unzulässig
+  if (is_post_step_stmt(body, vn, &st)) return false;
+  return body_assigns_var_anywhere(body, vn);
 }
 
-// --------------------------------------------------
-// Ausdruck-Emission
+/* ------------------------------------------------------------------------- */
+/* Ausdruck-Emission                                                          */
+static bool emit_stmt(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind); // fwd
 static void emit_expr(Em *e, Expr *x, VecSym *sy, int width_hint, bool bool_ctx);
 
-// Division/Modulo im Vektor-Kontext: to_signed(to_integer(L) op to_integer(R), W)
-// Peephole: 1 % X → to_signed(1, W)
 static void emit_divmod_vec(Em *e, BinOpKind op, Expr *l, Expr *r, VecSym *sy, int width_hint){
-  int w = (width_hint==64) ? 64 : 32; // Fallback 32
+  int w = (width_hint==64) ? 64 : 32;
 
   if (op==BIN_MOD && l && l->kind==EX_INT_LIT && l->int_lit.value==1){
     fprintf(e->f, "to_signed(1, %d)", w);
@@ -254,15 +286,12 @@ static void emit_unop(Em *e, UnOpKind op, Expr *sub, VecSym *sy, int width_hint)
   else { fputc('(', e->f); fputc('-', e->f); emit_expr(e, sub, sy, width_hint, false); fputc(')', e->f); }
 }
 static void emit_binop(Em *e, BinOpKind op, Expr *l, Expr *r, VecSym *sy, int width_hint){
-  // Spezialfall: / und mod brauchen Integer-Kontext → wieder in signed gießen
   if (op==BIN_DIV || op==BIN_MOD){
     fputc('(', e->f);
     emit_divmod_vec(e, op, l, r, sy, width_hint);
     fputc(')', e->f);
     return;
   }
-
-  // Alle anderen Binops wie gehabt
   fputc('(', e->f);
   emit_expr(e, l, sy, width_hint, (op==BIN_AND||op==BIN_OR));
   fprintf(e->f, " %s ", vhdl_binop(op));
@@ -280,22 +309,18 @@ static void emit_expr(Em *e, Expr *x, VecSym *sy, int width_hint, bool bool_ctx)
   (void)bool_ctx;
   if (!x){ fputs("(others => '0')", e->f); return; }
   switch (x->kind){
-    case EX_INT_LIT: emit_int_lit(e, (long long)x->int_lit.value, width_hint); return;
+    case EX_INT_LIT:  emit_int_lit(e, (long long)x->int_lit.value, width_hint); return;
     case EX_BOOL_LIT: fputs(x->bool_lit.value ? "'1'" : "'0'", e->f); return;
-    case EX_VAR: emit_var_ref(e, x->var.name); return;
-    case EX_UNOP: emit_unop(e, x->unop.op, x->unop.expr, sy, width_hint); return;
-    case EX_BINOP: emit_binop(e, x->binop.op, x->binop.lhs, x->binop.rhs, sy, width_hint); return;
-    case EX_ASSIGN: fputc('(', e->f); emit_assign_expr(e, x->assign.lhs, x->assign.rhs, sy); fputc(')', e->f); return;
-    case EX_CALL: fputs("/* call_unsupported */ (others => '0')", e->f); return;
+    case EX_VAR:      emit_var_ref(e, x->var.name); return;
+    case EX_UNOP:     emit_unop(e, x->unop.op, x->unop.expr, sy, width_hint); return;
+    case EX_BINOP:    emit_binop(e, x->binop.op, x->binop.lhs, x->binop.rhs, sy, width_hint); return;
+    case EX_ASSIGN:   fputc('(', e->f); emit_assign_expr(e, x->assign.lhs, x->assign.rhs, sy); fputc(')', e->f); return;
+    case EX_CALL:     fputs("/* call_unsupported */ (others => '0')", e->f); return;
   }
 }
 
-// --------------------------------------------------
-// Vorwärtsdeklaration
-static bool emit_stmt(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind);
-
-// --------------------------------------------------
-// For-Analyse aus for-Header
+/* ------------------------------------------------------------------------- */
+/* For-Analyse aus for-Header                                                */
 static bool build_shape_from_for_header(Stmt *s, const char **vn_out, ForShape *fs){
   if (!s || s->kind!=ST_FOR) return false;
   Expr *init = s->for_s.init, *cond=s->for_s.cond, *post=s->for_s.post;
@@ -324,8 +349,8 @@ static bool build_shape_from_for_header(Stmt *s, const char **vn_out, ForShape *
   return true;
 }
 
-// --------------------------------------------------
-// while-Unterstützung: initmap „Name → letztes Literal-Init-Stmt“ im Block
+/* ------------------------------------------------------------------------- */
+/* while-Unterstützung: Init-Map                                             */
 typedef struct { char *name; Stmt *stmt; } NameInit;
 VEC_LOCAL_DECL(NameInit, VecInit)
 
@@ -349,7 +374,7 @@ static void initmap_clear(VecInit *m, const char *name){
   }
 }
 
-// Prüfe, ob st die Form "vn = <int_lit>" oder "int vn = <int_lit>;" hat; liefert literal
+/* Literal-Init für vn? (VarDecl/Assign) */
 static bool stmt_is_literal_init_for(Stmt *st, const char *vn, long long *lit_out){
   if (!st || !vn) return false;
   if (st->kind==ST_VARDECL){
@@ -372,7 +397,7 @@ static bool stmt_is_literal_init_for(Stmt *st, const char *vn, long long *lit_ou
   return false;
 }
 
-// while-Muster analysieren mit bekanntem Init-Statement im selben Block
+/* while-Muster → ForShape */
 static bool analyze_while_with_init(Stmt *wh, Stmt *init_stmt, ForShape *fs, char **varname_out){
   if (!wh || wh->kind!=ST_WHILE) return false;
   Expr *cond = wh->while_s.cond;
@@ -383,7 +408,6 @@ static bool analyze_while_with_init(Stmt *wh, Stmt *init_stmt, ForShape *fs, cha
 
   if (!normalize_var_cmp(cond, &vn, &bound, &cmp)) return false;
 
-  // Body: letzter Satz muss i=i±1 sein; sonst ablehnen
   if (!body) return false;
   int step=0;
   if (body->kind==ST_BLOCK){
@@ -392,15 +416,11 @@ static bool analyze_while_with_init(Stmt *wh, Stmt *init_stmt, ForShape *fs, cha
   } else {
     if (!is_post_step_stmt(body, vn, &step)) return false;
   }
-
-  // Body darf i sonst nicht ändern
   if (body_assigns_var_except_trailing_step(body, vn)) return false;
 
-  // Startwert aus init_stmt (muss im selben Block vorher passiert sein)
   long long start=0;
   if (!stmt_is_literal_init_for(init_stmt, vn, &start)) return false;
 
-  // Schritt und Vergleich müssen zusammenpassen
   if (step==+1 && !(cmp==0||cmp==1)) return false;
   if (step==-1 && !(cmp==2||cmp==3)) return false;
 
@@ -412,7 +432,7 @@ static bool analyze_while_with_init(Stmt *wh, Stmt *init_stmt, ForShape *fs, cha
   return true;
 }
 
-// Body ohne das letzte "i=i±1" ausgeben
+/* Body ohne letztes i=i±1 emittieren */
 static bool emit_body_without_trailing_step(Em *e, Stmt *body, VecSym *sy, TypeKind ret_kind, const char *vn){
   if (!body) return true;
 
@@ -422,20 +442,18 @@ static bool emit_body_without_trailing_step(Em *e, Stmt *body, VecSym *sy, TypeK
     for (size_t i=0;i+1<n;i++){
       if (!emit_stmt(e, body->block.stmts.items[i], sy, ret_kind)) return false;
     }
-    // letztes Statement nur ausgeben, wenn es NICHT der Schritt ist
     int st=0;
     if (!is_post_step_stmt(body->block.stmts.items[n-1], vn, &st))
       return emit_stmt(e, body->block.stmts.items[n-1], sy, ret_kind);
     return true;
   }
 
-  // Single-Statement-Body:
   int st=0;
-  if (is_post_step_stmt(body, vn, &st)) return true; // Schritt → nicht emittieren
+  if (is_post_step_stmt(body, vn, &st)) return true;
   return emit_stmt(e, body, sy, ret_kind);
 }
 
-// VHDL-for Kopf für ForShape ausgeben; i-Zuweisung optional
+/* for-Kopf für ForShape emittieren; optional i := __i */
 static bool emit_for_loop_shape(Em *e, const char *vn, const ForShape *fs, bool need_i_assign, VecSym *sy){
   long long start = fs->start;
   long long end_incl = (fs->step == 1) ? ((fs->cmp == 0) ? (fs->bound - 1) : (fs->bound))
@@ -453,8 +471,8 @@ static bool emit_for_loop_shape(Em *e, const char *vn, const ForShape *fs, bool 
   return true;
 }
 
-// --------------------------------------------------
-// Prepass: Variablen unterdrücken, wenn sie im Loop-Body nie genutzt werden
+/* ------------------------------------------------------------------------- */
+/* Prepass: Loop-Variablen unterdrücken, wenn unbenutzt                      */
 static bool str_in_vec(VecStr *vs, const char *s){
   for (size_t i=0;i<vs->len;i++) if (vs->items[i] && s && strcmp(vs->items[i], s)==0) return true;
   return false;
@@ -493,8 +511,8 @@ static void collect_suppress_loop_vars(Stmt *s, VecStr *out){
   }
 }
 
-// --------------------------------------------------
-// Peephole-Helfer: if (v < 0) { v = v + ...; } nach Modulo-Assign v unterdrücken
+/* ------------------------------------------------------------------------- */
+/* Peephole: if (v < 0) { v = v + ...; } nach Modulo-Assign v unterdrücken  */
 static bool is_modulus_fixup_if(Stmt *ifstmt, const char *vn){
   if (!ifstmt || ifstmt->kind!=ST_IF || !vn) return false;
   Expr *cond = ifstmt->if_s.cond;
@@ -522,111 +540,165 @@ static bool is_modulus_fixup_if(Stmt *ifstmt, const char *vn){
   return left_is_vn || right_is_vn;
 }
 
-// --------------------------------------------------
-// Statement-Emission (Block-weise, inkl. Init-Map-Tracking)
-static bool emit_stmt_core(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind);
-
-static bool emit_block(Em *e, Stmt *blk, VecSym *sy, TypeKind ret_kind){
-  if (!blk || blk->kind!=ST_BLOCK) return false;
-
-  // Tracke letzte Literal-Inits pro Variable in diesem Block
-  VecInit initmap; VecInit_init(&initmap);
-
-  // Peephole-Tracking: sofort vorangegangene Modulo-Zuweisung "v := ... mod ...;"
-  const char *recent_mod_var = NULL;
-
-  for (size_t i=0;i<blk->block.stmts.len;i++){
-    Stmt *st = blk->block.stmts.items[i];
-
-    // Peephole: direkt nach mod-Assign das "if (v < 0) v = v + ...;" entfernen
-    if (recent_mod_var && st->kind==ST_IF && is_modulus_fixup_if(st, recent_mod_var)){
-      // auslassen
-      recent_mod_var = NULL;
-      continue;
-    }
-
-    // Spezieller while-Fall: versuche Transformation anhand initmap
-    if (st->kind==ST_WHILE){
-      Expr *cond = st->while_s.cond;
-      const char *vn = NULL; long long dummy_bound=0; int dummy_cmp=-1;
-      if (normalize_var_cmp(cond, &vn, &dummy_bound, &dummy_cmp) && vn){
-        Stmt *init_stmt = initmap_get(&initmap, vn);
-        ForShape fs; char *name_out=NULL;
-        if (analyze_while_with_init(st, init_stmt, &fs, &name_out)){
-          bool need_i_assign=false;
-          if (st->while_s.body){
-            if (st->while_s.body->kind==ST_BLOCK){
-              size_t n = st->while_s.body->block.stmts.len;
-              for (size_t j=0;j<n;j++){
-                if (j==n-1){ int step=0; if (is_post_step_stmt(st->while_s.body->block.stmts.items[j], vn, &step)) break; }
-                if (stmt_uses_var(st->while_s.body->block.stmts.items[j], vn)){ need_i_assign=true; break; }
-              }
-            } else {
-              int stp=0;
-              if (!is_post_step_stmt(st->while_s.body, vn, &stp) && stmt_uses_var(st->while_s.body, vn))
-                need_i_assign=true;
-            }
-          }
-          if (!emit_for_loop_shape(e, vn, &fs, need_i_assign, sy)){ VecInit_free(&initmap); return false; }
-          if (!emit_body_without_trailing_step(e, st->while_s.body, sy, ret_kind, vn)){ em_dec(e); VecInit_free(&initmap); return false; }
-          em_dec(e); em_ind(e); fputs("end loop;", e->f); em_nl(e);
-          recent_mod_var = NULL; // reset peephole state
-          continue;
-        }
-      }
-    }
-
-    // Normale Emission
-    if (!emit_stmt_core(e, st, sy, ret_kind)){ VecInit_free(&initmap); return false; }
-
-    // Nach dem Emittieren: initmap updaten + Peephole-Track setzen/clearen
-    // initmap:
-    if (st->kind==ST_VARDECL){
-      if (st->vardecl.init && st->vardecl.init->kind==EX_INT_LIT)
-        initmap_set(&initmap, st->vardecl.name, st);
-      else
-        initmap_clear(&initmap, st->vardecl.name);
-    } else if (st->kind==ST_EXPR && st->expr_s.expr && st->expr_s.expr->kind==EX_ASSIGN){
-      Expr *as = st->expr_s.expr;
-      if (as->assign.lhs && as->assign.lhs->kind==EX_VAR){
-        const char *vn2 = as->assign.lhs->var.name;
-        if (as->assign.rhs && as->assign.rhs->kind==EX_INT_LIT)
-          initmap_set(&initmap, vn2, st);
-        else
-          initmap_clear(&initmap, vn2);
-      }
-    }
-
-    // Peephole-Track: war dies ein "v := ... mod ...;"?
-    if (st->kind==ST_EXPR && st->expr_s.expr && st->expr_s.expr->kind==EX_ASSIGN){
-      Expr *as = st->expr_s.expr;
-      if (as->assign.lhs && as->assign.lhs->kind==EX_VAR &&
-          as->assign.rhs && as->assign.rhs->kind==EX_BINOP &&
-          as->assign.rhs->binop.op==BIN_MOD){
-        recent_mod_var = as->assign.lhs->var.name;
-      } else {
-        recent_mod_var = NULL;
-      }
-    } else {
-      recent_mod_var = NULL;
+/* ------------------------------------------------------------------------- */
+/* Helper: Return-Expr aus Statement extrahieren                             */
+static bool stmt_extract_return_expr(Stmt *node, Expr **out) {
+  if (!node) return false;
+  if (node->kind == ST_RETURN) {
+    if (out) *out = node->ret_s.expr;
+    return true;
+  }
+  if (node->kind == ST_BLOCK && node->block.stmts.len == 1) {
+    Stmt *s0 = node->block.stmts.items[0];
+    if (s0 && s0->kind == ST_RETURN) {
+      if (out) *out = s0->ret_s.expr;
+      return true;
     }
   }
-
-  VecInit_free(&initmap);
-  return true;
+  return false;
 }
+
+/* ------------------------------------------------------------------------- */
+/* Statement-Emission (inkl. While→For, Peepholes, Return-Folding)          */
+static bool emit_stmt_core(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind); // fwd
 
 static bool emit_stmt(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind){
   if (!s){ em_ind(e); fputs("-- <null stmt>", e->f); em_nl(e); return true; }
-  if (s->kind==ST_BLOCK) return emit_block(e, s, sy, ret_kind);
+
+  if (s->kind==ST_BLOCK){
+    VecInit initmap; VecInit_init(&initmap);
+    const char *recent_mod_var = NULL;
+
+    for (size_t i=0;i<s->block.stmts.len;i++){
+      Stmt *st = s->block.stmts.items[i];
+
+      /* Peephole: Modulo-Fixup unmittelbar danach entfernen */
+      if (recent_mod_var && st->kind==ST_IF && is_modulus_fixup_if(st, recent_mod_var)){
+        recent_mod_var = NULL;
+        continue;
+      }
+
+      /* Return-Folding: if (...) { return A; } return B; */
+      if (st->kind == ST_IF && st->if_s.then_br && st->if_s.else_br == NULL && (i + 1) < s->block.stmts.len) {
+        Expr *then_ret = NULL;
+        if (stmt_extract_return_expr(st->if_s.then_br, &then_ret)) {
+          Stmt *next = s->block.stmts.items[i + 1];
+          if (next && next->kind == ST_RETURN) {
+            const char *yname = "y";
+            if (g_have_hints && g_hints.output_name[0]) yname = g_hints.output_name;
+
+            em_ind(e); fputs("-- FOLDED if/return + return\n", e->f);
+            em_ind(e); fputs("if (", e->f); emit_expr(e, st->if_s.cond, sy, 0, true); fputs(") then", e->f); em_nl(e);
+            em_inc(e);
+            em_ind(e); fputs(yname, e->f); fputs(" <= ", e->f);
+            if (ret_kind==TY_BOOLEAN) emit_expr(e, then_ret, sy, 0, true);
+            else                      emit_expr(e, then_ret, sy, width_of(ret_kind), false);
+            fputs(";", e->f); em_nl(e);
+            em_dec(e);
+
+            em_ind(e); fputs("else", e->f); em_nl(e);
+            em_inc(e);
+            em_ind(e); fputs(yname, e->f); fputs(" <= ", e->f);
+            if (ret_kind==TY_BOOLEAN) emit_expr(e, next->ret_s.expr, sy, 0, true);
+            else                      emit_expr(e, next->ret_s.expr, sy, width_of(ret_kind), false);
+            fputs(";", e->f); em_nl(e);
+            em_dec(e);
+
+            em_ind(e); fputs("end if;", e->f); em_nl(e);
+
+            i += 1;                /* nächstes Return ist verarbeitet */
+            recent_mod_var = NULL; /* Peephole-Zustand zurücksetzen   */
+            continue;
+          }
+        }
+      }
+
+      /* while → for (Init im selben Block vorher) */
+      if (st->kind==ST_WHILE){
+        Expr *cond = st->while_s.cond;
+        const char *vn = NULL; long long dummy_bound=0; int dummy_cmp=-1;
+        if (normalize_var_cmp(cond, &vn, &dummy_bound, &dummy_cmp) && vn){
+          Stmt *init_stmt = NULL;
+          for (size_t j=0;j<i; ++j){
+            if (stmt_is_literal_init_for(s->block.stmts.items[j], vn, NULL)){
+              init_stmt = s->block.stmts.items[j];
+            }
+          }
+          ForShape fs; char *name_out=NULL;
+          if (init_stmt && analyze_while_with_init(st, init_stmt, &fs, &name_out)){
+            bool need_i_assign=false;
+            if (st->while_s.body){
+              if (st->while_s.body->kind==ST_BLOCK){
+                size_t n = st->while_s.body->block.stmts.len;
+                for (size_t j=0;j<n;j++){
+                  if (j==n-1){ int step=0; if (is_post_step_stmt(st->while_s.body->block.stmts.items[j], vn, &step)) break; }
+                  if (stmt_uses_var(st->while_s.body->block.stmts.items[j], vn)){ need_i_assign=true; break; }
+                }
+              } else {
+                int stp=0;
+                if (!is_post_step_stmt(st->while_s.body, vn, &stp) && stmt_uses_var(st->while_s.body, vn))
+                  need_i_assign=true;
+              }
+            }
+            if (!emit_for_loop_shape(e, vn, &fs, need_i_assign, sy)) { VecInit_free(&initmap); return false; }
+            if (!emit_body_without_trailing_step(e, st->while_s.body, sy, ret_kind, vn)){ em_dec(e); VecInit_free(&initmap); return false; }
+            em_dec(e); em_ind(e); fputs("end loop;", e->f); em_nl(e);
+            recent_mod_var = NULL;
+            continue;
+          }
+        }
+      }
+
+      /* Normale Emission */
+      if (!emit_stmt_core(e, st, sy, ret_kind)){ VecInit_free(&initmap); return false; }
+
+      /* Initmap pflegen für spätere while-Analysen */
+      if (st->kind==ST_VARDECL){
+        if (st->vardecl.init && st->vardecl.init->kind==EX_INT_LIT)
+          initmap_set(&initmap, st->vardecl.name, st);
+        else
+          initmap_clear(&initmap, st->vardecl.name);
+      } else if (st->kind==ST_EXPR && st->expr_s.expr && st->expr_s.expr->kind==EX_ASSIGN){
+        Expr *as = st->expr_s.expr;
+        if (as->assign.lhs && as->assign.lhs->kind==EX_VAR){
+          const char *vn2 = as->assign.lhs->var.name;
+          if (as->assign.rhs && as->assign.rhs->kind==EX_INT_LIT)
+            initmap_set(&initmap, vn2, st);
+          else
+            initmap_clear(&initmap, vn2);
+        }
+      }
+
+      /* Peephole-Track: war dies ein Modulo-Assign? */
+      if (st->kind==ST_EXPR && st->expr_s.expr && st->expr_s.expr->kind==EX_ASSIGN){
+        Expr *as = st->expr_s.expr;
+        if (as->assign.lhs && as->assign.lhs->kind==EX_VAR &&
+            as->assign.rhs && as->assign.rhs->kind==EX_BINOP &&
+            as->assign.rhs->binop.op==BIN_MOD){
+          recent_mod_var = as->assign.lhs->var.name;
+        } else {
+          recent_mod_var = NULL;
+        }
+      } else {
+        recent_mod_var = NULL;
+      }
+    }
+
+    VecInit_free(&initmap);
+    return true;
+  }
+
+  /* Kein Block → Kern */
   return emit_stmt_core(e, s, sy, ret_kind);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Kern-Emitter für Einzel-Statements                                        */
 static bool emit_stmt_core(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind){
   if (!s){ em_ind(e); fputs("-- <null stmt>", e->f); em_nl(e); return true; }
   switch (s->kind){
     case ST_BLOCK:
-      return emit_block(e, s, sy, ret_kind);
+      return emit_stmt(e, s, sy, ret_kind);
 
     case ST_IF:
       em_ind(e); fputs("if (", e->f); emit_expr(e, s->if_s.cond, sy, 0, true); fputs(") then", e->f); em_nl(e);
@@ -649,12 +721,16 @@ static bool emit_stmt_core(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind){
       return true;
     }
 
-    case ST_RETURN:
-      em_ind(e); fputs("y <= ", e->f);
+    case ST_RETURN: {
+      em_ind(e);
+      const char *yname = "y";
+      if (g_have_hints && g_hints.output_name[0]) yname = g_hints.output_name;
+      fputs(yname, e->f); fputs(" <= ", e->f);
       if (ret_kind==TY_BOOLEAN) emit_expr(e, s->ret_s.expr, sy, 0, true);
-      else emit_expr(e, s->ret_s.expr, sy, width_of(ret_kind), false);
+      else                      emit_expr(e, s->ret_s.expr, sy, width_of(ret_kind), false);
       fputs(";", e->f); em_nl(e);
       return true;
+    }
 
     case ST_VARDECL:
       if (s->vardecl.init){
@@ -678,8 +754,8 @@ static bool emit_stmt_core(Em *e, Stmt *s, VecSym *sy, TypeKind ret_kind){
   return false;
 }
 
-// --------------------------------------------------
-// Lokale Variablen einsammeln
+/* ------------------------------------------------------------------------- */
+/* Lokale Variablen einsammeln                                               */
 static void collect_locals(Stmt *s, VecSym *locals){
   if (!s) return;
   switch (s->kind){
@@ -706,57 +782,108 @@ static void collect_locals(Stmt *s, VecSym *locals){
   }
 }
 
-// --------------------------------------------------
-// Methoden-/Top-Level-Emission
+/* ------------------------------------------------------------------------- */
+/* Header & Prozesskopf                                                      */
+static void emit_vhdl_header(FILE *f){
+  fputs("library ieee;\n", f);
+  fputs("use ieee.std_logic_1164.all;\n", f);
+  fputs("use ieee.numeric_std.all;\n\n", f);
+}
+
+/* Prozesskopf:
+ * - v2008 & keine Sensitivität → process(all)
+ * - Falls Sensitivität vorhanden (has_sensitivity ODER sensitivity[0]) → diese Liste
+ * - Sonst: automatisch aus allen Eingangsparametern
+ */
+static void emit_process_header_for_method(FILE *f, Method *m){
+  bool has_list = false;
+  if (g_have_hints){
+    has_list = g_hints.has_sensitivity || (g_hints.sensitivity[0] != '\0'); /* akzeptiert auch Alias */
+  }
+
+  if (g_have_hints && g_hints.vhdl2008 && !has_list) {
+    fprintf(f, "  process(all) is\n");
+    return;
+  }
+  if (has_list) {
+    fprintf(f, "  process(%s) is\n", g_hints.sensitivity);
+    return;
+  }
+  /* Auto: alle Eingangs-Parameter */
+  fputs("  process(", f);
+  bool first = true;
+  for (size_t i=0;i<m->params.len;i++){
+    if (!first) fputs(", ", f);
+    fputs(m->params.items[i].name, f);
+    first=false;
+  }
+  if (first) fputs("y", f); /* Fallback */
+  fputs(") is\n", f);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Methoden-/Top-Level-Emission                                              */
 static bool name_in(const VecStr *vs, const char *n){
   for (size_t i=0;i<vs->len;i++) if (vs->items[i] && n && strcmp(vs->items[i], n)==0) return true;
   return false;
 }
-
-static void collect_suppress_loop_vars(Stmt *s, VecStr *out); // fwd
+static void collect_suppress_loop_vars(Stmt *s, VecStr *out); /* fwd */
 
 static void emit_method(Em *e, Method *m){
   TypeKind rk = m->ret_type.kind;
   if (rk == TY_VOID) return;
 
-  // Prepass: unterdrückbare Loop-Variablen
+  /* Prepass: unterdrückbare Loop-Variablen */
   VecStr suppress; VecStr_init(&suppress);
   if (m->body) collect_suppress_loop_vars(m->body, &suppress);
 
-  // Symboltabelle
+  /* Symboltabelle: Params + Locals(filtered) */
   VecSym sy; VecSym_init(&sy);
-  for (size_t i=0;i<m->params.len;i++){ Sym s; s.name=m->params.items[i].name; s.kind=m->params.items[i].type.kind; s.is_param=true; VecSym_push(&sy,s); }
-
-  // Lokale Variablen
+  for (size_t i=0;i<m->params.len;i++){
+    Sym s; s.name=m->params.items[i].name; s.kind=m->params.items[i].type.kind; s.is_param=true;
+    VecSym_push(&sy,s);
+  }
   VecSym locals; VecSym_init(&locals);
   if (m->body && m->body->kind==ST_BLOCK) collect_locals(m->body, &locals);
 
-  // Unterdrückte Variablen rausfiltern
   VecSym filtered; VecSym_init(&filtered);
   for (size_t i=0;i<locals.len;i++){ if (name_in(&suppress, locals.items[i].name)) continue; VecSym_push(&filtered, locals.items[i]); }
   for (size_t i=0;i<filtered.len;i++) VecSym_push(&sy, filtered.items[i]);
 
-  // Entity
-  fprintf(e->f, "entity %s is\n", m->name);
+  /* Entity-Name ggf. überschreiben */
+  const char *entity_name = m->name;
+  if (g_have_hints && g_hints.entity_name[0]) entity_name = g_hints.entity_name;
+
+  fprintf(e->f, "entity %s is\n", entity_name);
   fputs("  port(\n", e->f);
-  for (size_t i=0;i<m->params.len;i++) fprintf(e->f, "    %s : in %s;\n", m->params.items[i].name, vhdl_type(m->params.items[i].type.kind));
-  fprintf(e->f, "    y : out %s\n", vhdl_type(rk));
+  for (size_t i=0;i<m->params.len;i++){
+    fprintf(e->f, "    %s : in %s;\n", m->params.items[i].name, vhdl_type(m->params.items[i].type.kind));
+  }
+  const char *yname = "y";
+  if (g_have_hints && g_hints.output_name[0]) yname = g_hints.output_name;
+  fprintf(e->f, "    %s : out %s\n", yname, vhdl_type(rk));
   fputs("  );\n", e->f);
   fputs("end entity;\n", e->f);
 
-  // Architecture + Prozess
-  fprintf(e->f, "architecture rtl of %s is\n", m->name);
+  fprintf(e->f, "architecture rtl of %s is\n", entity_name);
   fputs("begin\n", e->f);
-  fputs("  process(all) is\n", e->f);
+
+  emit_process_header_for_method(e->f, m);
+
+  /* Lokale Variablen-Decls */
   for (size_t i=0;i<filtered.len;i++){
-    if (filtered.items[i].kind==TY_BOOLEAN) fprintf(e->f, "    variable %s : std_logic;\n", filtered.items[i].name);
-    else fprintf(e->f, "    variable %s : signed(%d downto 0);\n", filtered.items[i].name, width_of(filtered.items[i].kind)-1);
+    if (filtered.items[i].kind==TY_BOOLEAN)
+      fprintf(e->f, "    variable %s : std_logic;\n", filtered.items[i].name);
+    else
+      fprintf(e->f, "    variable %s : signed(%d downto 0);\n", filtered.items[i].name, width_of(filtered.items[i].kind)-1);
   }
   fputs("  begin\n", e->f);
-  if (rk==TY_BOOLEAN) fputs("    y <= '0';\n", e->f);
-  else                fputs("    y <= (others => '0');\n", e->f);
 
-  // Body
+  /* Default-Out (wird ggf. überschrieben) */
+  if (rk==TY_BOOLEAN) { fputs("    ", e->f); fputs(yname, e->f); fputs(" <= '0';\n", e->f); }
+  else                { fputs("    ", e->f); fputs(yname, e->f); fputs(" <= (others => '0');\n", e->f); }
+
+  /* Body */
   if (m->body){
     Em body=*e; body.indent=2;
     if (m->body->kind==ST_BLOCK){
@@ -780,14 +907,14 @@ static void emit_method(Em *e, Method *m){
   VecSym_free(&filtered);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Top-Level                                                                  */
 bool codegen_vhdl(Program *ir, const char *out_path){
   FILE *f = fopen(out_path, "wb");
   if (!f) return false;
   Em e; em_init(&e, f);
 
-  fputs("library ieee;\n", f);
-  fputs("use ieee.std_logic_1164.all;\n", f);
-  fputs("use ieee.numeric_std.all;\n\n", f);
+  emit_vhdl_header(f);
 
   if (ir->classes.len==0){ fputs("-- empty program\n", f); fclose(f); return true; }
 
